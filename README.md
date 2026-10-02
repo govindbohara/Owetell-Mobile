@@ -1,56 +1,119 @@
-# Welcome to your Expo app 👋
+# Owetell
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Owetell is a mobile app for splitting shared costs with housemates, friends or travel groups. Create a room, invite people, log who paid for what, and Owetell works out who owes whom.
 
-## Get started
+It's built with [Expo](https://expo.dev) (React Native) and uses [Firebase](https://firebase.google.com) for sign-in and data storage. It runs on iOS, Android and the web.
 
-1. Install dependencies
+## Features
 
-   ```bash
-   npm install
-   ```
+- **Accounts:** sign up with email and password, or with Google. Each user picks a unique username.
+- **Rooms:** a shared space for a group. Invite people with a link or QR code, manage members and roles, transfer ownership, and leave or delete rooms. Deleted rooms can be restored.
+- **Expenses:** record who paid and who the cost is split between. Edit, delete and restore expenses.
+- **Balances and settle up:** see each person's net balance (owed or owing) and record payments between members.
+- **Subscriptions:** track recurring costs (weekly, monthly, quarterly or yearly), see when the next payment is due, and confirm each charge.
+- **Analytics:** spending breakdowns for your rooms.
 
-2. Start the app
+## Tech stack
 
-   ```bash
-   npx expo start
-   ```
+| Area | What's used |
+| --- | --- |
+| App framework | Expo SDK 57, React Native, React 19 |
+| Navigation | Expo Router (file-based routing) |
+| Backend | Firebase Authentication and Cloud Firestore |
+| Google sign-in | `expo-auth-session` |
+| Validation | Zod |
+| Language | TypeScript |
 
-In the output, you'll find options to open the app in a
+## Getting started
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+### 1. Prerequisites
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+- [Node.js](https://nodejs.org) (LTS version)
+- A Firebase project with **Authentication** (Email/Password and Google) and **Cloud Firestore** turned on
+- For running on a device or simulator: Xcode (iOS) or Android Studio (Android)
 
-## Get a fresh project
-
-When you're ready, run:
+### 2. Install dependencies
 
 ```bash
-npm run reset-project
+npm install
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+### 3. Add your environment variables
 
-### Other setup steps
+Copy the example file and fill in your own values:
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```bash
+cp .env.example .env
+```
 
-## Learn more
+| Variable | Where to find it |
+| --- | --- |
+| `EXPO_PUBLIC_FIREBASE_*` | Firebase Console → Project settings → Your apps → Web app config |
+| `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` | Firebase Console → Authentication → Sign-in method → Google → Web SDK configuration |
+| `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID` / `EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID` | Google Cloud Console → APIs & Services → Credentials |
 
-To learn more about developing your project with Expo, look at the following resources:
+The Google client IDs are only needed for Google sign-in on iOS and Android. The web version uses Firebase's popup sign-in instead.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+> `.env` is listed in `.gitignore`, so it is never committed. Note that `EXPO_PUBLIC_*` values are built into the app, so anyone with the app can read them. Your Firestore security rules are what keep the data safe.
 
-## Join the community
+### 4. Deploy the Firestore security rules
 
-Join our community of developers creating universal apps.
+The rules live in `assets/1.rules`. Paste them into Firebase Console → Firestore Database → Rules, or deploy them with the Firebase CLI.
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+### 5. Run the app
+
+```bash
+npm run ios       # build and run on the iOS simulator
+npm run android   # build and run on an Android emulator or device
+npm run web       # run in the browser
+npm start         # start the dev server for an existing development build
+```
+
+The project uses a [development build](https://docs.expo.dev/develop/development-builds/introduction/) (`expo-dev-client`), so the first `npm run ios` or `npm run android` compiles the native app. That can take a few minutes.
+
+## Scripts
+
+| Command | What it does |
+| --- | --- |
+| `npm start` | Starts the Expo dev server |
+| `npm run ios` | Builds and runs the native iOS app |
+| `npm run android` | Builds and runs the native Android app |
+| `npm run web` | Runs the app in a web browser |
+| `npm run go` | Starts the dev server for Expo Go, with a cleared cache |
+| `npm run lint` | Checks the code with ESLint |
+| `npm run reset-project` | ⚠️ Expo starter script that moves the app code aside. Don't run it unless you want to start over. |
+
+## Project structure
+
+```
+src/
+├── app/            Screens. Each file is a route (Expo Router)
+│   ├── login.tsx         Sign in / sign up
+│   ├── onboarding.tsx    Choose a username after first sign-in
+│   └── private/          Screens for signed-in users
+│       ├── index.tsx         Home: your rooms
+│       ├── room/[id].tsx     A single room: expenses, balances, members
+│       ├── subs.tsx          Subscriptions
+│       └── analytics.tsx     Spending analytics
+├── components/     Reusable UI: sheets, rows, cards, tab bar
+├── config/         Firebase setup (separate native and web versions)
+├── contexts/       App-wide state: auth and rooms
+├── utils/          Firestore API calls, balance and billing maths, formatting
+├── constants/      Theme colours and fonts
+├── hooks/          Custom React hooks
+└── data/           Shared types and sample data
+assets/
+├── images/         App icons and splash images
+└── 1.rules         Firestore security rules
+```
+
+## How it works
+
+- **Sign-in flow:** `src/app/_layout.tsx` decides which screens you can reach. Signed-out users see the login screen, new users choose a username, and everyone else gets the main app.
+- **Money is stored in cents** (whole numbers) to avoid rounding errors. Amounts are shown in AUD by default.
+- **Balances:** `src/utils/balances.ts` adds up every expense and settlement in a room. A positive balance means the person is owed money, and a negative balance means they owe.
+- **Soft deletes:** deleted rooms and expenses are marked as deleted first, so they can be restored.
+
+## License
+
+See [LICENSE](LICENSE).
