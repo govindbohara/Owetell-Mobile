@@ -1,0 +1,458 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return signedIn() && resource.data.createdBy == request.auth.uid;
+    }
+
+    function willBeOwner() {
+      return signedIn() && request.resource.data.createdBy == request.auth.uid;
+    }
+
+    function canSeePlannerItem() {
+      return signedIn() && request.auth.uid in resource.data.visibleToUsers;
+    }
+
+    function canSeeSubscription() {
+      return signedIn() && request.auth.uid in resource.data.visibleToUsers;
+    }
+
+    function chargeOnlyChange() {
+      // skippedDates rides along with charges: answering a missed billing date is either
+      // "yes, this happened" (charges) or "no, it didn't" (skippedDates), and a member a
+      // subscription is shared with is allowed to answer either way. Both still exclude
+      // price, split and visibility.
+      return request.resource.data.diff(resource.data).changedKeys()
+        .hasOnly(['charges', 'skippedDates', 'lastChargedAt', 'updatedAt']);
+    }
+
+    function purchaseOnlyChange() {
+      return request.resource.data.diff(resource.data).changedKeys()
+        .hasOnly(['status', 'purchasedAt', 'convertedExpenseId', 'purchaseMode', 'purchaseCategory', 'updatedAt']);
+    }
+
+    function validRoomJoin(roomId) {
+      return signedIn()
+        && !(request.auth.uid in resource.data.memberIds)
+        && request.auth.uid in request.resource.data.memberIds
+        && request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['members', 'memberIds', 'lastJoin', 'roles', 'updatedAt'])
+        && request.resource.data.lastJoin.uid == request.auth.uid
+        && request.resource.data.memberIds.size() <= 50
+        // A join may ONLY add the joiner — never drop or replace existing members.
+        // Without these two checks a joiner could write memberIds: [self] and wipe
+        // everyone else out of the room.
+        && request.resource.data.memberIds.size() == resource.data.memberIds.size() + 1
+        && resource.data.memberIds.toSet().difference(request.resource.data.memberIds.toSet()).size() == 0
+        // Same pin for the members DISPLAY list (audit F4): it may only grow by the
+        // joiner's own entry, and every existing entry must survive unmodified — a
+        // joiner must not be able to rename, impersonate, or erase current members.
+        && request.resource.data.members.size() == resource.data.members.size() + 1
+        && resource.data.members.toSet().difference(request.resource.data.members.toSet()).size() == 0
+        // Only the room's CURRENT invite token may join. Rotation deletes the old doc
+        // anyway; this additionally kills forged or leftover invite docs as join
+        // capabilities the moment the room rotates (audit F3 companion).
+        && request.resource.data.lastJoin.token == resource.data.get('inviteToken', '')
+        // Joiners write their own role as an explicit 'edit' — the "missing key means
+        // edit" default stays scoped to pre-roles rooms, not to every future join.
+        // They may touch only their own key in the map.
+        && request.resource.data.get('roles', {}).get(request.auth.uid, '') == 'edit'
+        && request.resource.data.get('roles', {}).diff(resource.data.get('roles', {}))
+          .changedKeys().hasOnly([request.auth.uid])
+        && get(/databases/$(database)/documents/roomInvites/$(request.resource.data.lastJoin.token)).data.roomId == roomId
+        && request.time < get(/databases/$(database)/documents/roomInvites/$(request.resource.data.lastJoin.token)).data.createdAt + duration.value(7, 'd');
+    }
+
+    function isRoomMember(roomId) {
+      return signedIn()
+        && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.memberIds;
+    }
+
+    function userIsRoomMember(roomId, userId) {
+      return userId in get(/databases/$(database)/documents/rooms/$(roomId)).data.memberIds;
+    }
+
+    function roomMemberIds(roomId) {
+      return get(/databases/$(database)/documents/rooms/$(roomId)).data.memberIds;
+    }
+
+    function isRoomOwner(roomId) {
+      return signedIn()
+        && request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId;
+    }
+
+    // Roles are optional (D1). Enforcement is on when settings.rolesEnabled == true, OR —
+    // for a legacy room with no flag — when the roles map already assigned a tier ('read'
+    // or 'admin'). When OFF, every member is an editor regardless of the map. Mirrors
+    // rolesEnabled() in services/roles.js exactly.
+    function rolesEnforced(roomData) {
+      return roomData.get('settings', {}).get('rolesEnabled',
+        roomData.get('roles', {}).values().hasAny(['read', 'admin']));
+    }
+
+    // Role of uid in the room: 'owner'; 'edit' when roles aren't enforced; otherwise the
+    // explicit roles entry, defaulting to 'edit' when the key is absent. The absence
+    // default is load-bearing for every room created before roles shipped.
+    // Cost note: rules cache get() per request, and expense/settlement writes already
+    // get() this same room doc (isRoomMember/roomMemberIds), so this adds no reads.
+    function roomRole(roomId, uid) {
+      let room = get(/databases/$(database)/documents/rooms/$(roomId)).data;
+      return uid == room.ownerId ? 'owner'
+        : (rolesEnforced(room) ? room.get('roles', {}).get(uid, 'edit') : 'edit');
+    }
+
+    function isRoomEditor(roomId) {
+      return isRoomMember(roomId) && roomRole(roomId, request.auth.uid) != 'read';
+    }
+
+    // Same logic, evaluated against the room doc itself (no get) — for branches
+    // inside the /rooms/{roomId} match where resource IS the room.
+    function ownRoomRole() {
+      return request.auth.uid == resource.data.ownerId
+        ? 'owner'
+        : (rolesEnforced(resource.data) ? resource.data.get('roles', {}).get(request.auth.uid, 'edit') : 'edit');
+    }
+
+    // Editors may touch presentation, summary, soft-delete, and invite rotation —
+    // never ownerId, members, memberIds, or createdAt (membership changes only via
+    // the dedicated branches below). Viewers ('read') get no room-doc writes at all.
+    function memberRoomUpdate() {
+      return signedIn()
+        && request.auth.uid in resource.data.memberIds
+        && ownRoomRole() != 'read'
+        && request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['name', 'currencyCode', 'summary', 'updatedAt', 'deletedAt', 'deletedBy', 'inviteToken'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.currencyCode is string
+        && request.resource.data.currencyCode.size() <= 8;
+    }
+
+    // The roles map may only name current non-owner members, with values limited to
+    // the three non-owner roles. An empty/absent map is valid (legacy/flat rooms).
+    function validRolesField() {
+      let d = request.resource.data;
+      return d.get('roles', {}).keys().hasOnly(d.memberIds)
+        && !(d.ownerId in d.get('roles', {}))
+        && d.get('roles', {}).values().hasOnly(['admin', 'edit', 'read']);
+    }
+
+    // The optional-roles toggle. settings may carry only rolesEnabled (a bool); keeping
+    // the shape tight stops anything else being smuggled onto the room doc via this path.
+    function validSettingsField() {
+      let s = request.resource.data.get('settings', {});
+      return s.keys().hasOnly(['rolesEnabled']) && s.get('rolesEnabled', false) is bool;
+    }
+
+    // Owner edits the roles map and/or the rolesEnabled toggle: role changes, the lazy
+    // materialization of legacy rooms, and enabling/disabling tiers all land here.
+    // Instant — no balance check (revoking write access has no ledger implications;
+    // purging someone from the ledger does, see departure below). Owner-only: only the
+    // owner may assign roles (incl. 'admin') or flip the toggle. The audit event lands in
+    // the memberEvents subcollection (separate doc), not here.
+    function ownerRoleChange() {
+      return signedIn()
+        && request.auth.uid == resource.data.ownerId
+        && request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['roles', 'settings', 'updatedAt'])
+        && validRolesField()
+        && validSettingsField();
+    }
+
+    // Instant, no accept-flow. The new owner must already be a member; the old owner
+    // stays on as a regular member (their materialized role rides in `roles`).
+    function ownerTransfer() {
+      return signedIn()
+        && request.auth.uid == resource.data.ownerId
+        && request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['ownerId', 'roles', 'updatedAt'])
+        && request.resource.data.ownerId != resource.data.ownerId
+        && request.resource.data.ownerId in resource.data.memberIds
+        && validRolesField();
+    }
+
+    // Rules can't diff arrays, so the entry appended to removedMembers doubles as the
+    // declaration of who departed; the size + subset checks pin "exactly that uid was
+    // removed and nobody was added". A departing member's balance is preserved truthfully
+    // (no write-off, no zeroing) — calculateBalances keeps their real balance via the
+    // expenses' own stored splits, so money is still conserved without fabricating a
+    // settlement. Nothing in the ledger is created or deleted by a departure.
+    function departingEntry() {
+      return request.resource.data.removedMembers[request.resource.data.removedMembers.size() - 1];
+    }
+
+    function validMemberDeparture() {
+      let old = resource.data;
+      let next = request.resource.data;
+      let gone = departingEntry();
+      return next.diff(old).changedKeys()
+          .hasOnly(['members', 'memberIds', 'roles', 'removedMembers', 'summary', 'updatedAt', 'inviteToken'])
+        // Exactly one entry appended — except once removedMembers reaches its 50 cap,
+        // where the oldest entry is dropped as the newest is added (size stays 50). The
+        // departingEntry checks below still pin the last entry to the actual departure.
+        && next.removedMembers.size() <= 50
+        && (next.removedMembers.size() == old.get('removedMembers', []).size() + 1
+            || (old.get('removedMembers', []).size() >= 50 && next.removedMembers.size() == 50))
+        && gone.id is string
+        && gone.id != old.ownerId
+        && gone.id in old.memberIds
+        && !(gone.id in next.memberIds)
+        && next.memberIds.size() == old.memberIds.size() - 1
+        && next.memberIds.toSet().difference(old.memberIds.toSet()).size() == 0
+        // The members display list shrinks by exactly one existing entry, and every
+        // surviving entry passes through unmodified (audit F4) — no renaming others
+        // while riding a departure write.
+        && next.members.size() == old.members.size() - 1
+        && next.members.toSet().difference(old.members.toSet()).size() == 0
+        && !(gone.id in next.get('roles', {}))
+        && gone.removedAt is string
+        && validRolesField();
+    }
+
+    function ownerRemoveMember() {
+      return signedIn()
+        && request.auth.uid == resource.data.ownerId
+        && validMemberDeparture()
+        && departingEntry().reason == 'removed'
+        && departingEntry().removedBy == request.auth.uid;
+    }
+
+    // An admin (deputy owner) may remove a regular member — never the owner (already
+    // barred by validMemberDeparture's gone.id != ownerId) and never another admin
+    // (checked against the pre-write roles map). Owner-only powers — toggling roles,
+    // assigning roles, transferring ownership — stay out of this path.
+    function adminRemoveMember() {
+      return signedIn()
+        && ownRoomRole() == 'admin'
+        && validMemberDeparture()
+        && departingEntry().reason == 'removed'
+        && departingEntry().removedBy == request.auth.uid
+        && resource.data.get('roles', {}).get(departingEntry().id, 'edit') != 'admin';
+    }
+
+    // Owner cannot self-leave (transfer or delete the room instead) — enforced by the
+    // gone.id != ownerId check inside validMemberDeparture.
+    function selfLeaveRoom() {
+      return signedIn()
+        && request.auth.uid in resource.data.memberIds
+        && validMemberDeparture()
+        && departingEntry().id == request.auth.uid
+        && departingEntry().reason == 'left';
+    }
+
+    // Validates the merged expense document on create and update (full edits and
+    // soft-delete/restore writes both pass through here).
+    function validExpense(roomId) {
+      let d = request.resource.data;
+      return d.amountCents is int
+        && d.amountCents > 0
+        && d.amountCents <= 100000000
+        && d.description is string
+        && d.description.size() <= 200
+        && d.paidBy is string
+        && d.paidBy in roomMemberIds(roomId)
+        && d.splitWith is list
+        && d.splitWith.size() <= 50
+        // Every split participant must be a current member — a split naming ghosts or
+        // outsiders silently corrupts everyone's balances (audit F2). An EMPTY list is
+        // allowed: legacy docs use it to mean "all members" (split.js fallback), and
+        // that reading is harmless. This also forces every element to be a string.
+        && d.splitWith.toSet().difference(roomMemberIds(roomId).toSet()).size() == 0
+        // Percent splits may only name split participants. Rules can't sum map values,
+        // so the "integers summing to exactly 100" invariant stays client-side and MUST
+        // be mirrored in the MCP server (see MCP_SECURITY_CHECKLIST.md).
+        && (d.get('splitPercentages', null) == null
+          || (d.splitPercentages is map
+            && d.splitPercentages.keys().hasOnly(d.splitWith)))
+        && d.date is string
+        && (d.deletedAt == null || d.deletedAt is string);
+    }
+
+    // A finalized ledger entry that involves a member who has since departed is FROZEN —
+    // no edit, no soft-delete, no restore. The departed member's balance is preserved
+    // truthfully; mutating a past entry would silently rewrite history they can no longer
+    // act on. An entry is editable only while every party it names is still a current member.
+    function expenseEditable(roomId) {
+      let ids = roomMemberIds(roomId);
+      return resource.data.paidBy in ids
+        && resource.data.get('splitWith', []).toSet().difference(ids.toSet()).size() == 0;
+    }
+
+    function validSettlement(roomId) {
+      let d = request.resource.data;
+      return d.amountCents is int
+        && d.amountCents > 0
+        && d.amountCents <= 100000000
+        && d.from is string
+        && d.to is string
+        && d.from != d.to
+        && d.from in roomMemberIds(roomId)
+        && d.to in roomMemberIds(roomId)
+        && d.note is string
+        && d.note.size() <= 500
+        && (d.deletedAt == null || d.deletedAt is string);
+    }
+
+    // Minting an invite grows the room, so it requires editor (or owner) access — a
+    // read-only viewer must not be able to add members. getAfter() sees the room as it
+    // will exist after this batch, so the create-room batch (room + first invite) passes.
+    function canMintInvite() {
+      let room = getAfter(/databases/$(database)/documents/rooms/$(request.resource.data.roomId)).data;
+      return request.auth.uid in room.memberIds
+        && (request.auth.uid == room.ownerId || room.get('roles', {}).get(request.auth.uid, 'edit') != 'read')
+        && (request.resource.data.createdBy == request.auth.uid
+            || request.resource.data.createdBy == room.ownerId)
+        // createdAt anchors the 7-day expiry check in validRoomJoin — pin it to the
+        // server clock so a forged future timestamp can't mint a never-expiring invite
+        // (audit F3). Every client write uses serverTimestamp(), which rules see as
+        // request.time, so legitimate mints are unaffected.
+        && request.resource.data.createdAt == request.time;
+    }
+
+    // Shape guard for a room-index doc written into ANOTHER member's space (fan-out).
+    // Stops a co-editor from smuggling a doc for a different room or a malformed summary
+    // into someone else's Home. The owner of the index space (userId) is unconstrained.
+    function validRoomIndexWrite(roomId) {
+      let d = request.resource.data;
+      return d.roomId == roomId
+        && d.get('summary', {}) is map
+        && d.get('name', '') is string;
+    }
+
+    match /rooms/{roomId} {
+      allow read: if signedIn() && request.auth.uid in resource.data.memberIds;
+      allow create: if signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.memberIds == [request.auth.uid]
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.currencyCode is string
+        && request.resource.data.currencyCode.size() <= 8;
+      allow update: if memberRoomUpdate()
+        || validRoomJoin(roomId)
+        || ownerRoleChange()
+        || ownerTransfer()
+        || ownerRemoveMember()
+        || adminRemoveMember()
+        || selfLeaveRoom();
+      allow delete: if signedIn() && request.auth.uid == resource.data.ownerId;
+    }
+
+    match /rooms/{roomId}/expenses/{expenseId} {
+      allow read: if isRoomMember(roomId);
+      allow create: if isRoomEditor(roomId) && validExpense(roomId);
+      // Updates (full edits AND soft-delete/restore) are blocked once the expense
+      // touches a departed member — its allocation is frozen at departure.
+      allow update: if isRoomEditor(roomId) && validExpense(roomId) && expenseEditable(roomId);
+      // Hard delete: editors may purge only already-soft-deleted expenses (the
+      // "recently deleted" list); the room owner may purge anything (room teardown).
+      allow delete: if isRoomEditor(roomId)
+        && (resource.data.deletedAt != null || isRoomOwner(roomId));
+    }
+
+    // Append-only audit trail: one immutable doc per membership/role event (role change,
+    // ownership transfer, removal, leave). Complete history — no cap, no edits, no deletes.
+    // Any member may read it; a member may append only events stamped with their own uid
+    // as actorId (you can log only actions you took). Removals/leaves write here in the
+    // same atomic batch as the room-doc departure, where the actor is still a member.
+    match /rooms/{roomId}/memberEvents/{eventId} {
+      allow read: if isRoomMember(roomId);
+      allow create: if isRoomMember(roomId)
+        && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.type is string
+        && request.resource.data.at is string;
+      allow update, delete: if false;
+    }
+
+    match /rooms/{roomId}/settlements/{settlementId} {
+      allow read: if isRoomMember(roomId);
+      allow create: if isRoomEditor(roomId)
+        && validSettlement(roomId)
+        && request.resource.data.createdBy == request.auth.uid;
+      // validSettlement requires both parties to be current members, so any settlement
+      // naming a departed member is already frozen. Write-off settlements are immutable
+      // regardless — they record a closed-out balance that must never be re-opened.
+      allow update: if isRoomEditor(roomId)
+        && validSettlement(roomId)
+        && resource.data.get('writeOff', false) == false;
+      allow delete: if false;
+    }
+
+    // ponytail: the planner feature was removed 2026-08-03; nothing in the app reads or
+    // writes this collection anymore. Rules stay so existing docs remain readable and
+    // deletable by their owners. Drop this block once the data is migrated or wiped.
+    match /plannerItems/{itemId} {
+      allow read: if isOwner() || canSeePlannerItem();
+      allow create: if willBeOwner() && request.auth.uid in request.resource.data.visibleToUsers;
+      allow update: if isOwner() || (canSeePlannerItem() && purchaseOnlyChange());
+      allow delete: if isOwner();
+    }
+
+    match /subscriptions/{subscriptionId} {
+      allow read: if isOwner() || canSeeSubscription();
+      allow create: if willBeOwner() && request.auth.uid in request.resource.data.visibleToUsers;
+      // A member a subscription is shared with can confirm or skip a charge, but must not
+      // be able to rewrite the price, split, or who else can see it.
+      allow update: if isOwner() || (canSeeSubscription() && chargeOnlyChange());
+      allow delete: if isOwner();
+    }
+
+    match /profiles/{userId} {
+      // get-only: profile docs are fetched by ID; denying list prevents user enumeration.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create, update: if signedIn() && request.auth.uid == userId;
+    }
+
+    match /usernames/{username} {
+      // get-only: username docs are fetched by ID; denying list prevents enumeration.
+      allow get: if signedIn();
+      allow list: if false;
+      // A username can be claimed only if free, and renamed/updated only by its holder.
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /roomInvites/{inviteToken} {
+      // get-only: tokens are unguessable capability URLs; allowing list would let any
+      // signed-in user enumerate every invite token and join every room.
+      allow get: if signedIn();
+      allow list: if false;
+      // Only EDITORS/owners of the target room may mint invites for it. Without the
+      // membership check, anyone could forge an invite doc for an arbitrary roomId and
+      // use it to pass validRoomJoin; without the role check, a viewer could grow the
+      // room. getAfter() sees the same-batch room create.
+      allow create: if signedIn() && canMintInvite();
+      allow update: if false;
+      allow delete: if signedIn() && (
+        request.auth.uid == resource.data.createdBy ||
+        request.auth.uid in get(/databases/$(database)/documents/rooms/$(resource.data.roomId)).data.memberIds
+      );
+    }
+
+    match /users/{userId}/rooms/{roomId} {
+      allow read: if signedIn() && request.auth.uid == userId;
+      // A user always controls their own index space. A co-member may fan a summary out
+      // into someone else's space only as an EDITOR (viewers can't forge another
+      // member's Home) and only with a well-formed, matching-roomId doc.
+      allow create, update: if signedIn() && (
+        request.auth.uid == userId ||
+        (isRoomEditor(roomId) && userIsRoomMember(roomId, userId) && validRoomIndexWrite(roomId))
+      );
+      allow delete: if signedIn() && (
+        request.auth.uid == userId ||
+        (isRoomEditor(roomId) && userIsRoomMember(roomId, userId))
+      );
+    }
+  }
+}
